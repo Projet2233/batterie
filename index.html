@@ -1,0 +1,672 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Batteries HID</title>
+<style>
+:root{--bg:#000;--card:#000;--fg:#e8eaf0;--mut:#8b91a1;--ok:#3ddc84;--mid:#ffb020;--low:#ff5a5f;--acc:#6ea8ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif;padding:24px;max-width:860px;margin-inline:auto}
+h1{font-size:22px;margin:0 0 4px}
+p.sub{color:var(--mut);margin:0 0 20px}
+button{background:var(--acc);color:#07101f;border:0;border-radius:8px;padding:10px 16px;font-weight:600;cursor:pointer;font-size:14px}
+button.ghost{background:transparent;color:var(--acc);border:1px solid var(--acc)}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px}
+.card{background:var(--card);border:1px solid #23262e;border-radius:12px;padding:16px;margin-bottom:14px}
+.card h2{margin:0;font-size:17px}
+.meta{color:var(--mut);font-size:12.5px;margin-top:2px}
+.bar{height:12px;background:#2a2f3a;border-radius:6px;overflow:hidden;margin:12px 0 6px}
+.bar>i{display:block;height:100%;width:0;background:var(--ok);transition:width .4s}
+.pct{font-size:26px;font-weight:700}
+.none{color:var(--mut);font-size:14px;margin-top:10px}
+details{margin-top:10px}summary{cursor:pointer;color:var(--mut);font-size:13px}
+pre{background:#0b0d11;border-radius:8px;padding:10px;overflow:auto;max-height:260px;font-size:12px;color:#b9c0d0;white-space:pre-wrap}
+.led{margin-top:6px}
+.ledrow{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin:8px 0}
+.ledrow label{display:inline-flex;align-items:center;gap:8px;font-size:14px;color:var(--fg);margin-right:10px;white-space:nowrap;cursor:pointer}
+.ledrow input[type=checkbox]{appearance:none;-webkit-appearance:none;width:20px;height:20px;margin:0;border-radius:50%;border:2px solid var(--mut);background:transparent;cursor:pointer;transition:.15s;display:inline-grid;place-content:center}
+.ledrow input[type=checkbox]::after{content:"";width:10px;height:10px;border-radius:50%;background:var(--acc);transform:scale(0);transition:.15s}
+.ledrow input[type=checkbox]:checked{border-color:var(--acc)}
+.ledrow input[type=checkbox]:checked::after{transform:scale(1)}
+.ledrow input[type=checkbox]:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.led button{margin-right:8px}
+.led .sw{display:flex;gap:12px;flex-wrap:wrap;margin:10px 0}
+.led .sw button{width:46px;height:46px;border-radius:50%;border:3px solid transparent;padding:0;margin:0}
+.led .sw button.on{border-color:#fff}
+.led select{background:#0b0d11;color:var(--fg);border:1px solid #2a2f3a;border-radius:6px;padding:4px 8px}
+.wait{cursor:pointer}
+.stats{display:flex;gap:28px;flex-wrap:wrap;margin-top:10px}
+.stat b{font-size:26px;font-weight:700}
+.meteo-top{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-top:10px}
+.meteo-top .t{font-size:26px;font-weight:700}
+.meteo-days{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}
+.meteo-days div{flex:1;min-width:110px;background:#0b0d11;border-radius:8px;padding:8px 10px;font-size:13px}
+.meteo-days b{display:block;font-size:12.5px;color:var(--mut);font-weight:500}
+.warn{background:#2a1d10;border:1px solid #6b4a1c;color:#f3c98b;padding:12px;border-radius:10px;font-size:13.5px;margin-bottom:16px}
+</style>
+</head>
+<body>
+<h1>Niveaux de batterie</h1>
+
+<div id="unsupported" class="warn" role="alert" hidden>WebHID n'est pas disponible. Utilise Chrome ou Edge sur ordinateur, via <b>http://localhost</b> ou HTTPS.</div>
+
+<div class="row">
+  <button id="add">+ Ajouter un appareil</button>
+  <button id="refresh" class="ghost">⟳ Actualiser</button>
+</div>
+
+<div id="list"></div>
+
+
+<script>
+const $ = s => document.querySelector(s);
+if (!('hid' in navigator)){ $('#unsupported').hidden = false; $('#add').disabled = true; }
+
+const BATT_USAGES = {
+  0x00850064: 'Niveau relatif',
+  0x00850065: 'Niveau absolu',
+  0x00850066: 'Capacité restante',
+  0x00060020: 'Force batterie'
+};
+const hex = (dv) => [...new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength)].map(b => b.toString(16).padStart(2,'0')).join(' ');
+
+const groups = new Map(); // clé -> {name, vid, pid, devices:[], battery, log:[], timers:[]}
+
+// Les 4 appareils pris en charge ; tout le reste est ignoré (jamais affiché, jamais proposé).
+const SLOTS = [
+  {id: 'manette', name: 'Manette', fem: true, match: d => d.vendorId === 0x054c && [0x05c4, 0x09cc, 0x0ce6, 0x0df2].includes(d.productId),
+   filters: [0x05c4, 0x09cc, 0x0ce6, 0x0df2].map(productId => ({vendorId: 0x054c, productId}))},
+  {id: 'casque', name: 'Casque', match: d => d.vendorId === 0x03f0 && [0x06be, 0x02cc].includes(d.productId),
+   filters: [0x06be, 0x02cc].map(productId => ({vendorId: 0x03f0, productId}))},
+  {id: 'souris', name: 'Souris', fem: true, match: d => d.vendorId === 0x046d && (d.collections || []).some(c => c.usagePage === 0xff00),
+   filters: [{vendorId: 0x046d, usagePage: 0xff00}]},
+  {id: 'led', name: 'LED', match: d => d.vendorId === 0x26ce && d.productId === 0x01a2,
+   filters: [{vendorId: 0x26ce, productId: 0x01a2}]}
+];
+const slotOf = d => SLOTS.find(sl => sl.match(d));
+const groupKey = d => (slotOf(d) || {}).id || null;
+function dropGroup(id){
+  const g = groups.get(id);
+  if (g) (g.timers || []).forEach(clearInterval);
+  groups.delete(id);
+}
+const h4 = n => n.toString(16).padStart(4,'0');
+
+function readBits(dv, bitOff, size){
+  let v = 0;
+  for (let i = 0; i < size; i++){
+    const bit = bitOff + i, byte = bit >> 3;
+    if (byte >= dv.byteLength) return null;
+    if ((dv.getUint8(byte) >> (bit & 7)) & 1) v += 2 ** i;
+  }
+  return v;
+}
+
+function collectBatteryFields(collections){
+  const out = [];
+  const walk = (cols) => cols.forEach(c => {
+    [['input', c.inputReports], ['feature', c.featureReports]].forEach(([kind, reports]) => {
+      (reports || []).forEach(r => {
+        let off = 0;
+        (r.items || []).forEach(it => {
+          const n = it.reportCount, size = it.reportSize;
+          let usages = it.isRange
+            ? Array.from({length: it.usageMaximum - it.usageMinimum + 1}, (_, i) => it.usageMinimum + i)
+            : (it.usages || []);
+          if (!it.isConstant && usages.length){
+            for (let i = 0; i < n; i++){
+              const u = usages[Math.min(i, usages.length - 1)];
+              if (BATT_USAGES[u]) out.push({
+                kind, reportId: r.reportId, bitOffset: off + i * size, size,
+                min: it.logicalMinimum, max: it.logicalMaximum, label: BATT_USAGES[u]
+              });
+            }
+          }
+          off += n * size;
+        });
+      });
+    });
+    walk(c.children || []);
+  });
+  walk(collections);
+  return out;
+}
+
+function setBattery(g, pct, status, source){
+  pct = Math.max(0, Math.min(100, Math.round(pct)));
+  const b = g.battery;
+  if (b && b.pct === pct && b.status === status && b.source === source){ b.t = Date.now(); return; }
+  g.battery = {pct, status, source, t: Date.now()};
+  render();
+}
+
+function parseStandard(g, field, dv){
+  const raw = readBits(dv, field.bitOffset, field.size);
+  if (raw == null) return;
+  const span = field.max - field.min;
+  const pct = span > 0 ? (raw - field.min) / span * 100 : raw;
+  setBattery(g, pct, null, `HID standard · ${field.label}`);
+}
+
+function parseSony(g, d, e){
+  const dv = e.data, id = e.reportId, pid = d.productId;
+  // DualSense (0CE6) / Edge (0DF2)
+  if (pid === 0x0ce6 || pid === 0x0df2){
+    let idx = id === 0x01 ? 52 : id === 0x31 ? 53 : -1;
+    if (idx < 0 || idx >= dv.byteLength) return;
+    const b = dv.getUint8(idx), lvl = b & 0x0f, st = b >> 4;
+    const pct = st === 2 ? 100 : Math.min(lvl * 10 + 5, 100);
+    setBattery(g, pct, st === 1 ? 'En charge' : st === 2 ? 'Chargée' : null, 'DualSense');
+  }
+  // DualShock 4
+  else if (pid === 0x05c4 || pid === 0x09cc){
+    let idx = id === 0x01 ? 29 : id === 0x11 ? 31 : -1;
+    if (idx < 0 || idx >= dv.byteLength) return;
+    const b = dv.getUint8(idx), lvl = b & 0x0f, cable = !!(b & 0x10);
+    const pct = cable ? Math.min(lvl, 10) * 10 : Math.min(lvl, 8) / 8 * 100;
+    const st = cable ? (lvl >= 11 ? 'Charge terminée' : 'En charge') : null;
+    setBattery(g, pct, st, `DualShock 4 · niveau brut ${lvl}${cable ? ' (0-10 sur câble, 11 = pleine)' : ' (0-8 sur batterie)'}`);
+  }
+}
+
+async function attach(d){
+  const key = groupKey(d);
+  if (!key) return;                                   // appareil non pris en charge : ignoré
+  let g = groups.get(key);
+  if (!g){
+    g = {name: d.productName || 'Appareil HID', vid: d.vendorId, pid: d.productId, devices: [], battery: null, log: [], fields: 0, timer: null};
+    groups.set(key, g);
+  }
+  if (g.devices.includes(d)) return;
+  g.devices.push(d);
+  try { if (!d.opened) await Promise.race([d.open(), new Promise((_, no) => setTimeout(() => no(new Error('délai dépassé')), 4000))]); }
+  catch (err){ pushLog(g, `Ouverture impossible : ${err.message}`); g.devices = g.devices.filter(x => x !== d); render(); return; }   // réessayé au prochain passage
+
+  const fields = collectBatteryFields(d.collections);
+  g.fields += fields.length;
+  const inputFields = fields.filter(f => f.kind === 'input');
+  const featFields = fields.filter(f => f.kind === 'feature');
+
+  const sony = d.vendorId === 0x054c;
+  if (sony && (d.productId === 0x0ce6 || d.productId === 0x0df2)){
+    try { await d.receiveFeatureReport(0x05); } catch {} // active les rapports complets en Bluetooth
+  }
+
+  d.addEventListener('inputreport', e => {
+    pushLog(g, `in  #${e.reportId}: ${hex(e.data).slice(0, 120)}`);
+    inputFields.filter(f => f.reportId === e.reportId).forEach(f => parseStandard(g, f, e.data));
+    if (e.reportId === 0x11 || e.reportId === 0x10) hidppOnReport(g, e);
+    if (e.reportId === 0x0c) hxOnReport(g, e);
+    if (g.ledPending) ledOnReport(g, e);
+    if (sony) parseSony(g, d, e);
+  });
+
+  const pollFeatures = async () => {
+    for (const f of featFields){
+      try { parseStandard(g, f, await d.receiveFeatureReport(f.reportId)); } catch {}
+    }
+  };
+  if (featFields.length){ g.pollFeat = pollFeatures; await pollFeatures(); }
+  startHidpp(g);
+  startHyperx(g);
+  startLed(g);
+  render();
+}
+
+/* ---------- Logitech HID++ 2.0 (récepteur LIGHTSPEED, ex. G502 X) ---------- */
+const SW = 5; // identifiant logiciel mis dans chaque requête, pour reconnaître nos réponses
+const VOLT = [[4186,100],[4067,90],[3989,80],[3922,70],[3859,60],[3811,50],[3778,40],[3750,30],[3722,20],[3668,10],[3531,5],[3300,0]];
+function voltToPct(mv){
+  if (mv >= VOLT[0][0]) return 100;
+  for (let i = 1; i < VOLT.length; i++){
+    if (mv >= VOLT[i][0]){
+      const [v1, p1] = VOLT[i - 1], [v0, p0] = VOLT[i];
+      return p0 + (mv - v0) / (v1 - v0) * (p1 - p0);
+    }
+  }
+  return 0;
+}
+const pushLog = (g, line) => { g.log.push(line); if (g.log.length > 60) g.log.shift(); if (!line.startsWith('in ')) g.note = line; };
+const hidppSupported = d => d.vendorId === 0x046d && d.collections.some(c => (c.outputReports || []).some(r => r.reportId === 0x10));
+
+// Envoie une requête courte (rapport 0x10) et attend la réponse longue (rapport 0x11) correspondante.
+function hidppRequest(g, devIdx, featIdx, func, params = [], timeout = 700){
+  const out = g.devices.find(d => d.opened && hidppSupported(d));
+  if (!out) return Promise.resolve(null);
+  g.pending ||= new Map();
+  const fs = (func << 4) | SW, key = `${devIdx}:${featIdx}:${fs}`;
+  const payload = new Uint8Array([devIdx, featIdx, fs, params[0] || 0, params[1] || 0, params[2] || 0]);
+  return new Promise(resolve => {
+    const done = r => { clearTimeout(t); g.pending.delete(key); resolve(r); };
+    const t = setTimeout(() => done(null), timeout);
+    g.pending.set(key, done);
+    out.sendReport(0x10, payload).catch(err => { pushLog(g, `HID++ envoi impossible : ${err.message}`); done(null); });
+  });
+}
+
+function hidppOnReport(g, e){
+  const b = new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength);
+  if (b.length < 4) return;
+  let key, res;
+  if (b[1] === 0xFF || b[1] === 0x8F){ key = `${b[0]}:${b[2]}:${b[3]}`; res = {error: b[4], v: b[1] === 0xFF ? 2 : 1}; }   // erreur HID++ 2.0 / 1.0
+  else { key = `${b[0]}:${b[1]}:${b[2]}`; res = {data: b}; }
+  const cb = g.pending && g.pending.get(key);
+  if (cb){ cb(res); return; }
+  // notification spontanée de la souris (identifiant logiciel 0)
+  const st = g.hidpp;
+  if (st && b[0] === st.devIdx && b[1] === st.featIdx && (b[2] & 0x0f) === 0) applyBattery(g, st, b);
+}
+
+function applyBattery(g, st, b){
+  let pct, status = null;
+  if (st.feature === 0x1004){            // batterie unifiée : [%, niveau, charge, alim. externe]
+    const soc = b[3], lvl = b[4], chg = b[5];
+    pct = soc > 0 ? soc : (lvl & 8 ? 100 : lvl & 4 ? 60 : lvl & 2 ? 20 : lvl & 1 ? 5 : 0);
+    status = chg === 1 || chg === 2 ? 'En charge' : chg === 3 ? 'Charge terminée' : chg === 4 ? 'Erreur de charge' : null;
+  } else if (st.feature === 0x1000){     // état de batterie : [%, prochain %, statut]
+    pct = b[3];
+    status = [1, 2, 4].includes(b[5]) ? 'En charge' : b[5] === 3 ? 'Charge terminée' : null;
+  } else {                               // tension en mV
+    pct = voltToPct((b[3] << 8) | b[4]);
+    status = (b[5] & 0x80) ? 'En charge' : null;
+  }
+  setBattery(g, pct, status, `Logitech HID++ · ${st.label}`);
+}
+
+async function hidppPoll(g){
+  const st = g.hidpp;
+  if (!st || g._hpPolling) return;
+  g._hpPolling = true;
+  try { return await hidppPollOnce(g, st); } finally { g._hpPolling = false; }
+}
+async function hidppPollOnce(g, st){
+  const r = await hidppRequest(g, st.devIdx, st.featIdx, st.feature === 0x1004 ? 1 : 0, [], 1000);
+  if (r && r.data){ applyBattery(g, st, r.data); return true; }
+  pushLog(g, `HID++ : pas de réponse${r && r.error != null ? ` (erreur ${r.error})` : ''} — souris en veille ? bouge-la puis clique sur Actualiser.`);
+  return false;
+}
+
+// Une seule question, trouvée par le test : appareil n°1, fonction « batterie unifiée » 0x1004 située à l'index 6, fonction 1 = lecture.
+// (Si la souris ou le récepteur change, il faut refaire le test pour retrouver l'index.)
+const HIDPP_Q = {devIdx: 1, featIdx: 6, feature: 0x1004, label: 'batterie unifiée 0x1004'};
+async function hidppSearch(g){
+  g.hidpp = {...HIDPP_Q};
+  return hidppPoll(g);
+}
+async function startHidpp(g){
+  if (g._hidppBusy || g.hidpp || !g.devices.some(d => d.opened && hidppSupported(d))) return;
+  g._hidppBusy = true;
+  try {
+    await new Promise(r => setTimeout(r, 400));    // laisse le temps d'attacher les deux interfaces du récepteur
+    await hidppSearch(g);
+  } finally { g._hidppBusy = false; render(); }
+}
+
+/* ---------- HyperX Cloud III S Wireless (dongle 03f0:06be / 03f0:02cc) ---------- */
+// Requête : rapport de sortie 0x0C = 02 03 01 00 <commande> ; réponse : rapport d'entrée 0x0C avec la commande en écho puis la valeur.
+// Commande 0x06 = batterie (0-100, 0xFF = indisponible) ; 0x48 = charge (0 non, 1 en charge, 2 pleine).
+const hxSupported = d => d.vendorId === 0x03f0 && d.collections.some(c => (c.outputReports || []).some(r => r.reportId === 0x0c));
+function hxReportLen(d){
+  for (const c of d.collections) for (const r of (c.outputReports || [])) if (r.reportId === 0x0c){
+    let bits = 0; (r.items || []).forEach(it => bits += it.reportSize * it.reportCount);
+    if (bits) return Math.ceil(bits / 8);
+  }
+  return 63;
+}
+function hxRequest(g, cmd, timeout = 1500){
+  const out = g.devices.find(d => d.opened && hxSupported(d));
+  if (!out) return Promise.resolve(undefined);
+  g.hxPending ||= new Map();
+  const data = new Uint8Array(hxReportLen(out)); data.set([0x02, 0x03, 0x01, 0x00, cmd]);
+  return new Promise(resolve => {
+    const done = v => { clearTimeout(t); g.hxPending.delete(cmd); resolve(v); };
+    const t = setTimeout(() => done(undefined), timeout);
+    g.hxPending.set(cmd, done);
+    out.sendReport(0x0c, data).catch(err => { pushLog(g, `HyperX envoi impossible : ${err.message}`); done(undefined); });
+  });
+}
+function hxOnReport(g, e){
+  const b = new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength);
+  const off = b[4] === 0x06 || b[4] === 0x48 ? 4 : (b[5] === 0x06 || b[5] === 0x48 ? 5 : -1);   // tolère un octet de décalage
+  if (off < 0) return;
+  const cb = g.hxPending && g.hxPending.get(b[off]);
+  if (cb) cb(b[off + 1]);
+}
+async function hxPoll(g){
+  if (g._hxPolling) return false;
+  g._hxPolling = true;
+  try { return await hxPollOnce(g); } finally { g._hxPolling = false; }
+}
+async function hxPollOnce(g){
+  const bat = await hxRequest(g, 0x06);
+  if (bat === undefined){ pushLog(g, 'HyperX : pas de réponse du dongle.'); return false; }
+  if (bat === 0xFF){ pushLog(g, 'HyperX : batterie indisponible (casque éteint ou pas connecté au dongle ?).'); return false; }
+  const chg = await hxRequest(g, 0x48);
+  setBattery(g, bat, chg === 1 ? 'En charge' : chg === 2 ? 'Charge terminée' : null, 'HyperX · dongle (commande 0x06)');
+  return true;
+}
+async function startHyperx(g){
+  if (g._hxBusy || g.hx || !g.devices.some(d => d.opened && hxSupported(d))) return;
+  g._hxBusy = true;
+  try {
+    if (await hxPoll(g)) g.hx = true;
+  } finally { g._hxBusy = false; render(); }
+}
+
+/* ---------- Éclairage carte mère ASRock Polychrome (LED Controller 26ce:01a2) ---------- */
+// Protocole communautaire NON officiel (implémentation frugalRGB, testée sur une autre carte ASRock).
+// On n'utilise que : lecture de configuration (0x14), réglage d'une zone (0x10) et validation (0x12).
+// On n'écrit JAMAIS la configuration (0x15). Rien n'est envoyé sans clic sur un bouton.
+const LED_ZONES = ['Header RGB 1', 'Header RGB 2', 'Header ARGB 1', 'Header ARGB 2', 'Chipset (PCH)', 'Capot I/O', 'PCB', 'Audio'];
+const ledSupported = d => d.vendorId === 0x26ce && d.productId === 0x01a2 && d.collections.some(c => (c.outputReports || []).length);
+function ledOutInfo(d){
+  for (const c of d.collections) for (const r of (c.outputReports || [])){
+    let bits = 0; (r.items || []).forEach(it => bits += it.reportSize * it.reportCount);
+    return {id: r.reportId, len: bits ? Math.ceil(bits / 8) : 64};
+  }
+}
+const hexArr = a => [...a].map(x => x.toString(16).padStart(2, '0')).join(' ');
+function ledRequest(g, fill, timeout = 1000){
+  const d = g.devices.find(d => d.opened && ledSupported(d));
+  const info = d && ledOutInfo(d);
+  if (!info || info.len < 16) return Promise.resolve(undefined);
+  const data = new Uint8Array(info.len); fill(data);
+  return new Promise(resolve => {
+    const t = setTimeout(() => { g.ledPending = null; resolve(null); }, timeout);
+    g.ledPending = r => { clearTimeout(t); g.ledPending = null; resolve(r); };
+    pushLog(g, `LED → ${hexArr(data.slice(0, 12))}`);
+    d.sendReport(info.id, data).catch(err => { clearTimeout(t); g.ledPending = null; pushLog(g, `LED envoi impossible : ${err.message}`); resolve(undefined); });
+  });
+}
+function ledOnReport(g, e){
+  const cb = g.ledPending;
+  if (cb) cb(new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength));
+}
+// Octets du paquet « régler une zone » (hors octet d'ID de rapport). Ordre des couleurs par défaut : G, R, B.
+function ledZonePacket(zone, mode, rgb, order){
+  const ch = {R: rgb[0], G: rgb[1], B: rgb[2]};
+  return d => { d[0] = 0x10; d[2] = zone; d[3] = mode; d[4] = ch[order[0]]; d[5] = ch[order[1]]; d[6] = ch[order[2]]; d[7] = 0xE0; d[8] = 0xFF; d[15] = 0; };
+}
+const ledCommit = d => { d[0] = 0x12; };
+
+async function startLed(g){
+  if (g.led || g._ledBusy || !g.devices.some(d => d.opened && ledSupported(d))) return;
+  g._ledBusy = true;
+  try {
+    const rd = tbl => ledRequest(g, b => { b[0] = 0x14; b[2] = tbl; });   // lectures seules, sans effet sur le contrôleur
+    const counts = await rd(0x02), avail = await rd(0x01);
+    if (!counts || !avail){
+      g.led = {error: 'Le contrôleur n\'a pas répondu aux lectures de configuration : le protocole est probablement différent sur ta carte. Je n\'envoie rien.'};
+      return;
+    }
+    const zones = [];
+    for (let i = 0; i < 8; i++) if (counts[4 + i] !== 0x1E && ((avail[4] >> i) & 1)) zones.push(i);
+    g.led = zones.length ? {zones} : {error: 'Aucune zone d\'éclairage détectée par la lecture de configuration. Je n\'envoie rien.'};
+  } finally { g._ledBusy = false; render(); }
+}
+
+const hexToRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const LED_COLORS = [['Rouge', '#ff0000'], ['Vert', '#00ff00'], ['Bleu', '#0000ff'], ['Violet', '#8000ff'], ['Jaune', '#ffff00'], ['Blanc', '#ffffff']];
+// Toutes les zones reçoivent la même couleur, octets envoyés dans l'ordre G, R, B (ordre natif du contrôleur).
+const LED_CHOICES = [[2, 'Avant'], [3, 'Haut'], [7, 'Ventirad']];   // zones proposées (le Header RGB 1 n'est pas utilisé)
+function ledPanel(g){
+  const el = document.createElement('div'); el.className = 'led'; el.dataset.led = '1';
+  if (g.led.error){ el.innerHTML = '<div class="none"></div>'; el.firstChild.textContent = g.led.error; return el; }
+  el.innerHTML = `
+    <div class="ledrow">${LED_CHOICES.filter(([z]) => g.led.zones.includes(z)).map(([z, n]) => `<label><input type="checkbox" data-zone="${z}" checked> ${n}</label>`).join(' ')}<button class="ghost" data-off style="margin-left:4px">Éteindre</button></div>
+    <div class="sw">${LED_COLORS.map(([n, h]) => `<button data-c="${h}" title="${n}" aria-label="${n}" aria-pressed="false" style="background:${h}"></button>`).join('')}</div>
+    <span class="meta" data-status></span>`;
+  const st = el.querySelector('[data-status]');
+  const apply = async (off, rgb) => {
+    st.textContent = '';
+    try {
+      const zones = [...el.querySelectorAll('[data-zone]:checked')].map(x => +x.dataset.zone);
+      if (!zones.length){ st.textContent = 'Coche au moins une LED.'; return; }
+      for (const z of zones) await ledRequest(g, ledZonePacket(z, off ? 0 : 1, off ? [0, 0, 0] : rgb, 'GRB'));
+      await ledRequest(g, ledCommit);
+    } catch (err){ st.textContent = 'Échec : ' + err.message; }
+  };
+  el.querySelectorAll('[data-c]').forEach(btn => btn.onclick = () => {
+    el.querySelectorAll('[data-c]').forEach(b => { b.classList.toggle('on', b === btn); b.setAttribute('aria-pressed', String(b === btn)); });
+    apply(false, hexToRgb(btn.dataset.c));
+  });
+  el.querySelector('[data-off]').onclick = () => {
+    el.querySelectorAll('[data-c]').forEach(b => { b.classList.remove('on'); b.setAttribute('aria-pressed', 'false'); });
+    apply(true);
+  };
+  return el;
+}
+
+function color(p){ return p > 50 ? 'var(--ok)' : p > 20 ? 'var(--mid)' : 'var(--low)'; }
+
+
+/* ---------- Logo adaptatif (favicon + titre) : suit l'appareil le moins chargé parmi manette, casque, souris ---------- */
+const favLink = Object.assign(document.createElement('link'), {rel: 'icon', type: 'image/png'});
+document.head.appendChild(favLink);
+const favCv = Object.assign(document.createElement('canvas'), {width: 64, height: 64}), favCtx = favCv.getContext('2d');
+let _fav = '';
+function updateFavicon(){
+  let low = null;
+  ['manette', 'casque', 'souris'].forEach(id => {
+    const b = groups.get(id) && groups.get(id).battery;
+    if (b && (!low || b.pct < low.pct)) low = b;
+  });
+  const pct = low ? low.pct : null, chg = !!(low && /en charge/i.test(low.status || ''));
+  const key = pct + '|' + chg; if (key === _fav) return; _fav = key;
+  const c = favCtx, rr = (x, y, w, h, r) => { c.beginPath(); c.roundRect(x, y, w, h, r); };
+  const col = pct == null ? '#8b91a1' : pct > 50 ? '#3ddc84' : pct > 20 ? '#ffb020' : '#ff5a5f';
+  c.clearRect(0, 0, 64, 64);
+  c.fillStyle = col; rr(56, 24, 7, 16, 3); c.fill();
+  c.lineWidth = 5; c.strokeStyle = col; rr(3.5, 12.5, 50, 39, 9); c.stroke();
+  if (pct != null){ c.fillStyle = col; rr(9, 18, Math.max(5, 38 * pct / 100), 28, 4); c.fill(); }
+  if (chg){
+    const bolt = new Path2D('M34 19 L23 34 H30 L28 45 L40 29 H33 Z');
+    c.lineWidth = 3; c.strokeStyle = '#000'; c.stroke(bolt); c.fillStyle = '#fff'; c.fill(bolt);
+  }
+  favLink.href = favCv.toDataURL('image/png');
+  document.title = pct == null ? 'Batteries HID' : `${pct}%${chg ? ' ⚡' : ''} · Batteries HID`;
+}
+
+const WAITING = id => `<div class="none wait" data-auth="${id}" role="button" tabindex="0">Attente de connexion</div>`;
+
+function render(){
+  const root = $('#list');
+  SLOTS.forEach(slot => {
+    let el = root.querySelector(`.card[data-slot="${slot.id}"]`);
+    if (!el){
+      el = document.createElement('div'); el.className = 'card'; el.dataset.slot = slot.id;
+      el.innerHTML = '<h2></h2><div data-batt aria-live="polite"></div>';
+      el.querySelector('h2').textContent = slot.name;
+      root.appendChild(el);
+    }
+    const g = groups.get(slot.id), box = el.querySelector('[data-batt]');
+    if (el._g !== g){ el.querySelectorAll('[data-led]').forEach(x => x.remove()); el._g = g; }   // nouvelle connexion : on repart propre
+    let html;
+    if (slot.id === 'led'){
+      if (g && g.led){ if (!el.querySelector('[data-led]')) box.after(ledPanel(g)); html = ''; }
+      else html = WAITING(slot.id);
+    } else {
+      const b = g && g.battery;
+      html = b
+        ? `<div class="pct" style="color:${color(b.pct)}">${b.pct}%${b.status ? ` <small style="font-size:16px;font-weight:500;color:var(--fg)">· ${b.status}</small>` : ''}</div>
+           <div class="bar"><i style="width:${b.pct}%;background:${color(b.pct)}"></i></div>`
+        : (g && g.devices.length ? '<div class="none">Connexion…</div>' : WAITING(slot.id));
+    }
+    if (box._html !== html){ box.innerHTML = html; box._html = html; }
+  });
+  sortCards();
+  updateFavicon();
+  checkAlerts();
+}
+
+// Météo : modèles Météo France (AROME / ARPEGE) via Open-Meteo, sans clé.
+const WMO = {0:'Ciel dégagé',1:'Plutôt dégagé',2:'Partiellement nuageux',3:'Couvert',45:'Brouillard',48:'Brouillard givrant',51:'Bruine légère',53:'Bruine',55:'Bruine forte',56:'Bruine verglaçante',57:'Bruine verglaçante',61:'Pluie faible',63:'Pluie',65:'Pluie forte',66:'Pluie verglaçante',67:'Pluie verglaçante',71:'Neige faible',73:'Neige',75:'Neige forte',77:'Grains de neige',80:'Averses faibles',81:'Averses',82:'Averses violentes',85:'Averses de neige',86:'Averses de neige',95:'Orage',96:'Orage et grêle',99:'Orage et grêle'};
+const METEO = {name: 'Brignoles (83170)', lat: 43.4064, lon: 6.0617};
+const today = () => new Date().toLocaleDateString('sv-SE');          // AAAA-MM-JJ, heure locale
+let meteo = {data: null, err: null, busy: false, at: 0};
+try { const c = JSON.parse(localStorage.getItem('meteoCache') || 'null'); if (c && c.day === today()) meteo.data = c.data; } catch {}
+const esc = t => String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function meteoCard(){
+  const root = $('#list');
+  let el = root.querySelector('.card[data-slot="meteo"]');
+  if (!el){
+    el = document.createElement('div'); el.className = 'card'; el.dataset.slot = 'meteo';
+    el.innerHTML = '<h2 style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap"><span>Météo</span><span data-date style="font-size:14px;font-weight:500;color:var(--mut)"></span></h2><div data-body></div>';
+  }
+  const anchor = root.querySelector('.card[data-slot="led"]');   // juste avant LED
+  if (!el.parentNode || el.nextSibling !== anchor) root.insertBefore(el, anchor);
+  return el;
+}
+
+function drawMeteo(){
+  const el = meteoCard(), box = el.querySelector('[data-body]');
+  const dt = new Date().toLocaleDateString('fr-FR', {weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'});
+  el.querySelector('[data-date]').textContent = dt;
+  const d = meteo.data;
+  let html;
+  if (!d) html = `<div class="none">${meteo.err ? esc(meteo.err) : 'Chargement…'}</div>`;
+  else {
+    const y = d.daily;
+    // +2 min : Open-Meteo calcule le coucher un peu plus tôt que Météo France (méthode différente)
+    const hm = t => { const x = new Date(t); x.setMinutes(x.getMinutes() + 2); return String(x.getHours()).padStart(2,'0') + ' h ' + String(x.getMinutes()).padStart(2,'0'); };
+    html = `<div class="stats">
+        <div class="stat"><b>${Math.round(y.temperature_2m_min[0])}° / ${Math.round(y.temperature_2m_max[0])}°</b></div>
+        <div class="stat"><b>${hm(y.sunset[0])}</b></div>
+      </div>`;
+  }
+  if (box._html !== html){ box.innerHTML = html; box._html = html; }
+}
+
+// Un seul appel par jour : le résultat est gardé dans le navigateur jusqu'au lendemain.
+async function updateMeteo(){
+  if (meteo.data && meteo.data.day !== today()) meteo.data = null;
+  drawMeteo();
+  if (meteo.data || meteo.busy || Date.now() - meteo.at < 60000) return;   // en cas d'échec : nouvel essai dans 1 min
+  meteo.busy = true;
+  try {
+    const u = 'https://api.open-meteo.com/v1/meteofrance?latitude=' + METEO.lat + '&longitude=' + METEO.lon +
+      '&daily=weather_code,temperature_2m_max,temperature_2m_min,wind_speed_10m_max,precipitation_sum,sunrise,sunset' +
+      '&forecast_days=4&timezone=Europe%2FParis';
+    const w = await (await fetch(u)).json();
+    if (!w.daily) throw new Error('Pas de données');
+    w.day = today();
+    meteo.data = w; meteo.err = null;
+    try { localStorage.setItem('meteoCache', JSON.stringify({day: w.day, data: w})); } catch {}
+  } catch (e) { meteo.err = 'Hors connexion'; meteo.at = Date.now(); }
+  meteo.busy = false;
+  drawMeteo();
+}
+
+// Autorisation (une seule fois par appareil, exigée par Chrome) : clic sur « Attente de connexion ».
+async function authorize(id){
+  const slot = id && SLOTS.find(x => x.id === id);
+  if (!('hid' in navigator) || authorize.busy) return;
+  authorize.busy = true;
+  const btn = $('#add'); btn.disabled = true;
+  try {
+    // sans id (bouton « Ajouter ») : les 4 types d'appareils compatibles ; les autres ne sont jamais proposés
+    const devs = await navigator.hid.requestDevice({filters: slot ? slot.filters : SLOTS.flatMap(x => x.filters)});
+    for (const d of devs) await attach(d);
+  } catch {} finally { authorize.busy = false; btn.disabled = false; }
+}
+$('#add').onclick = () => authorize();
+$('#list').addEventListener('click', ev => { const t = ev.target.closest('[data-auth]'); if (t) authorize(t.dataset.auth); });
+$('#list').addEventListener('keydown', ev => {
+  const t = ev.target.closest && ev.target.closest('[data-auth]');
+  if (t && (ev.key === 'Enter' || ev.key === ' ')){ ev.preventDefault(); authorize(t.dataset.auth); }
+});
+
+/* ---------- Tri : du plus faible au plus élevé, appareils non connectés en bas (Météo et LED restent dessous) ---------- */
+function sortCards(){
+  const root = $('#list');
+  const rank = id => { const g = groups.get(id), b = g && g.battery; return b ? b.pct : 1000 + (g && g.devices.length ? 0 : 1); };
+  const devs = ['manette', 'casque', 'souris'].map((id, i) => [id, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]);
+  const order = [...devs.map(x => root.querySelector(`.card[data-slot="${x[0]}"]`)),
+    root.querySelector('.card[data-slot="meteo"]'), root.querySelector('.card[data-slot="led"]')].filter(Boolean);
+  order.forEach((el, i) => { if (root.children[i] !== el) root.insertBefore(el, root.children[i] || null); });
+}
+
+/* ---------- Notifications (API Notification de Chrome) : batterie faible et connexion ---------- */
+const canNotify = 'Notification' in window;
+const LOW = 35;                                   // seuil de batterie faible (%)
+// Demande d'autorisation automatique au chargement (uniquement si Chrome ne l'a pas encore demandée).
+async function askNotifPermission(){
+  if (!canNotify || Notification.permission !== 'default') return;
+  try { await Notification.requestPermission(); } catch {}
+  checkAlerts();
+}
+function notify(title, body, tag){
+  if (!canNotify || Notification.permission !== 'granted') return false;
+  try { new Notification(title, {body, tag, icon: favLink.href}); return true; } catch { return false; }
+}
+// Batterie faible : une seule notification par descente sous le seuil ; réarmée quand l'appareil remonte (≥ seuil + 5) ou se met en charge.
+let lowFlags = {}; try { lowFlags = JSON.parse(localStorage.getItem('lowNotified') || '{}'); } catch {}
+function checkAlerts(){
+  let dirty = false;
+  ['manette', 'casque', 'souris'].forEach(id => {
+    const b = groups.get(id) && groups.get(id).battery; if (!b) return;
+    const chg = /en charge/i.test(b.status || '');
+    if (b.pct <= LOW && !chg){
+      if (!lowFlags[id] && notify(`${SLOTS.find(x => x.id === id).name} : batterie faible`, `Il reste ${b.pct} %`, 'low-' + id)){ lowFlags[id] = 1; dirty = true; }
+    } else if ((b.pct >= LOW + 5 || chg) && lowFlags[id]){ delete lowFlags[id]; dirty = true; }
+  });
+  if (dirty) try { localStorage.setItem('lowNotified', JSON.stringify(lowFlags)); } catch {}
+}
+
+/* ---------- Connexion / déconnexion d'un appareil ---------- */
+// Déconnexion : la carte repasse à « Attente de connexion » (donc en bas de la liste).
+// Connexion : la page se recharge toute seule (comme F5, ce qui évite le blocage du récepteur Logitech) puis notifie le niveau.
+const connQueue = new Set(); let connTimer = null;
+if ('hid' in navigator){
+  navigator.hid.addEventListener('disconnect', ev => {
+    const id = groupKey(ev.device), g = id && groups.get(id);
+    if (!g) return;
+    g.devices = g.devices.filter(x => x !== ev.device);
+    if (!g.devices.length){ dropGroup(id); render(); }
+  });
+  navigator.hid.addEventListener('connect', ev => {
+    const sl = slotOf(ev.device); if (!sl || sl.id === 'led') return;
+    connQueue.add(sl.id); clearTimeout(connTimer);
+    connTimer = setTimeout(() => {
+      let last = 0; try { last = +sessionStorage.getItem('connReloadAt') || 0; } catch {}
+      if (Date.now() - last < 15000){ connQueue.clear(); return; }               // anti-boucle
+      try { sessionStorage.setItem('connNotif', JSON.stringify({ids: [...connQueue], t: Date.now()})); sessionStorage.setItem('connReloadAt', String(Date.now())); } catch {}
+      location.reload();
+    }, 1500);
+  });
+}
+function flushConnNotif(){
+  let p = null;
+  try { p = JSON.parse(sessionStorage.getItem('connNotif') || 'null'); sessionStorage.removeItem('connNotif'); } catch {}
+  if (!p || Date.now() - p.t > 30000) return;
+  const t0 = Date.now(), pending = new Set(p.ids);
+  const tick = () => {
+    for (const id of [...pending]){
+      const b = groups.get(id) && groups.get(id).battery;
+      if (!b && Date.now() - t0 < 10000) continue;
+      pending.delete(id);
+      const sl = SLOTS.find(x => x.id === id);
+      notify(`${sl.name} ${sl.fem ? 'connectée' : 'connecté'}`, b ? `Batterie : ${b.pct} %${b.status ? ' · ' + b.status : ''}` : 'Niveau de batterie non lu', 'conn-' + id);
+    }
+    if (pending.size) setTimeout(tick, 500);
+  };
+  tick();
+}
+
+/* ---------- Bouton Actualiser = F5 ---------- */
+$('#refresh').onclick = () => location.reload();
+
+// Lecture unique au chargement de la page (ou à chaque clic sur Actualiser / F5).
+render();
+(async () => {
+  askNotifPermission();
+  try { if ('hid' in navigator) for (const d of await navigator.hid.getDevices()) if (slotOf(d)) attach(d); } catch {}
+  flushConnNotif();
+  updateMeteo();
+})();
+render();
+</script>
+</body>
+</html>
